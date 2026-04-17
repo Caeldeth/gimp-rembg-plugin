@@ -10,6 +10,7 @@
 
 import sys
 import os
+import shutil
 import tempfile
 import subprocess
 import configparser
@@ -20,13 +21,17 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gimp, GimpUi, GLib, Gtk, Gio
 
 tupleModel = [
+    "birefnet-general",
+    "birefnet-massive",
+    "birefnet-general-lite",
+    "birefnet-portrait",
+    "isnet-general-use",
+    "isnet-anime",
     "u2net",
     "u2net_human_seg",
     "u2net_cloth_seg",
     "u2netp",
     "silueta",
-    "isnet-general-use",
-    "isnet-anime",
     "sam"
 ]
 
@@ -53,8 +58,29 @@ def load_config():
     # Load from file if it exists
     if os.path.exists(config_path):
         config.read(config_path)
-    
+
     return config
+
+def resolve_python_executable(configured_path):
+    """Return (python_exe_path, None) on success or (None, reason) on failure."""
+    configured = (configured_path or '').strip()
+    if configured and configured.lower() != 'python':
+        if os.path.isfile(configured):
+            return configured, None
+        return None, (
+            f"Configured python_executable not found: {configured}. "
+            "Edit config.ini to point to a Python with rembg installed."
+        )
+
+    for candidate in ('python', 'python3', 'py'):
+        found = shutil.which(candidate)
+        if found:
+            return found, None
+
+    return None, (
+        "No Python executable found on PATH. "
+        "Set python_executable in config.ini to a Python with rembg installed."
+    )
 
 class RemoveBGPlugin(Gimp.PlugIn):
 
@@ -89,9 +115,9 @@ class RemoveBGPlugin(Gimp.PlugIn):
         tdir = tempfile.gettempdir()
         import time
         timestamp = str(int(time.time() * 1000))
-        jpg_file = os.path.join(tdir, f"Temp-gimp-{timestamp}.jpg")
-        png_file = os.path.join(tdir, f"Temp-gimp-{timestamp}.png")
-        return jpg_file, png_file
+        input_file = os.path.join(tdir, f"Temp-gimp-{timestamp}-in.png")
+        output_file = os.path.join(tdir, f"Temp-gimp-{timestamp}-out.png")
+        return input_file, output_file
 
     def _get_layer_info(self, image):
         """Get layer information and validate image"""
@@ -109,34 +135,38 @@ class RemoveBGPlugin(Gimp.PlugIn):
             
         return cur_layer, (x1, y1), None
 
-    def _export_layer_to_jpeg(self, image, jpg_file):
-        """Export the current layer to a temporary JPEG file"""
-        file_obj = Gio.File.new_for_path(jpg_file)
+    def _export_layer_to_png(self, image, png_path):
+        """Export the current image to a temporary PNG file (preserves alpha)"""
+        file_obj = Gio.File.new_for_path(png_path)
         export_result = Gimp.file_save(
             Gimp.RunMode.NONINTERACTIVE,
             image, file_obj, None
         )
         return export_result
 
-    def _build_rembg_command(self, sel_model, alpha_matting, ae_value, jpg_file, png_file):
-        """Build the rembg command with all parameters"""
-        python_exe = self.config.get('Paths', 'python_executable', fallback='python')
-        
+    def _build_rembg_command(self, sel_model, alpha_matting, ae_value, input_file, output_file):
+        """Build the rembg command. Returns (cmd, None) or (None, error_message)."""
+        configured = self.config.get('Paths', 'python_executable', fallback='')
+        python_exe, err = resolve_python_executable(configured)
+        if err:
+            return None, err
+
         cmd = [
-            str(python_exe), '-m', 'rembg.cli', 'i', '-m', str(tupleModel[sel_model])
+            python_exe, '-m', 'rembg.cli', 'i', '-m', str(tupleModel[sel_model])
         ]
         if alpha_matting:
             cmd.extend(['-a', '-ae', str(ae_value)])
-        cmd.extend([str(jpg_file), str(png_file)])
-        
+        cmd.extend([str(input_file), str(output_file)])
+
         if self.config.getboolean('Debug', 'debug_enabled'):
             terminal_cmd = ' '.join(cmd)
             Gimp.message(f"DEBUG: Command: {terminal_cmd}")
-            
-        return cmd
+
+        return cmd, None
 
     def _execute_rembg(self, cmd):
         """Execute the rembg command and handle errors"""
+        python_exe = cmd[0] if cmd else ''
         try:
             process = subprocess.Popen(
                 cmd,
@@ -145,17 +175,30 @@ class RemoveBGPlugin(Gimp.PlugIn):
                 shell=False,
                 text=True
             )
-            
+
             stdout, stderr = process.communicate()
-            
+
             if process.returncode != 0:
+                if stderr and 'No module named' in stderr and 'rembg' in stderr:
+                    return False, (
+                        f"rembg is not installed in {python_exe}. "
+                        f"Install it with: \"{python_exe}\" -m pip install \"rembg[cli]\""
+                    )
                 return False, f"rembg error (code {process.returncode}): {stderr}"
-                
+
+        except FileNotFoundError:
+            if self.config.getboolean('Debug', 'debug_enabled'):
+                Gimp.message(f"DEBUG: Python executable not found: {python_exe}")
+            return False, (
+                f"Python executable not found: {python_exe}. "
+                "Edit config.ini to point to a Python with rembg installed, "
+                "or install rembg with: pip install \"rembg[cli]\""
+            )
         except Exception as subprocess_error:
             if self.config.getboolean('Debug', 'debug_enabled'):
                 Gimp.message(f"DEBUG: Subprocess exception: {type(subprocess_error).__name__}: {subprocess_error}")
             return False, f"Subprocess error: {str(subprocess_error)}"
-            
+
         return True, None
 
     def _load_processed_image(self, png_file):
@@ -235,7 +278,7 @@ class RemoveBGPlugin(Gimp.PlugIn):
 
     def remove_background_from_image(self, image, as_mask, sel_model, alpha_matting, ae_value, make_square):
         """Remove background from a single image - main orchestrator method"""
-        jpg_file, png_file = self._create_temp_files()
+        input_file, output_file = self._create_temp_files()
         loaded_image = None
 
         try:
@@ -244,17 +287,19 @@ class RemoveBGPlugin(Gimp.PlugIn):
             if error:
                 return False, error
 
-            # Export layer to JPEG
-            self._export_layer_to_jpeg(image, jpg_file)
+            # Export image to PNG (preserves alpha; avoids JPEG's white-fill of transparent pixels)
+            self._export_layer_to_png(image, input_file)
 
             # Build and execute rembg command
-            cmd = self._build_rembg_command(sel_model, alpha_matting, ae_value, jpg_file, png_file)
+            cmd, error = self._build_rembg_command(sel_model, alpha_matting, ae_value, input_file, output_file)
+            if error:
+                return False, error
             success, error = self._execute_rembg(cmd)
             if not success:
                 return False, error
 
             # Load processed image
-            source_layer, loaded_image, error = self._load_processed_image(png_file)
+            source_layer, loaded_image, error = self._load_processed_image(output_file)
             if error:
                 return False, error
 
@@ -284,7 +329,7 @@ class RemoveBGPlugin(Gimp.PlugIn):
             # Clean up resources
             if loaded_image:
                 loaded_image.delete()
-            self._cleanup_temp_files(jpg_file, png_file)
+            self._cleanup_temp_files(input_file, output_file)
 
         return True, "Success"
 
